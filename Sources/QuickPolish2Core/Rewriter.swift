@@ -25,35 +25,73 @@ private let userPrompts: [RewriteMode: String] = [
     .shorter: "Rewrite this in natural American English, then trim it down. Keep the meaning and tone. Remove redundancy without losing the point.\n\nText: %@"
 ]
 
+public enum RewriterError: Error, CustomStringConvertible {
+    case apiError(status: Int, message: String)
+    case badJSON(String)
+    case networkFailure(String)
+
+    public var description: String {
+        switch self {
+        case .apiError(let status, let message):
+            return "API \(status): \(message)"
+        case .badJSON(let info):
+            return "Bad JSON: \(info)"
+        case .networkFailure(let info):
+            return "Network: \(info)"
+        }
+    }
+}
+
 public struct Rewriter {
     let apiKey: String
     let model: String
     let session: URLSessionProtocol
 
-    public init(apiKey: String, model: String = "gpt-4o", session: URLSessionProtocol = URLSession.shared) {
+    public init(apiKey: String, model: String = "gpt-4o-mini", session: URLSessionProtocol = URLSession.shared) {
         self.apiKey = apiKey
         self.model = model
         self.session = session
     }
 
     public func rewriteAll(text: String) async -> RewriteResult {
-        await withTaskGroup(of: (RewriteMode, String).self) { group in
+        await withTaskGroup(of: (RewriteMode, Result<String, Error>).self) { group in
             for mode in RewriteMode.allCases {
                 group.addTask {
-                    let result = (try? await rewrite(text: text, mode: mode)) ?? "[error]"
-                    return (mode, result)
+                    do {
+                        let text = try await rewrite(text: text, mode: mode)
+                        return (mode, .success(text))
+                    } catch {
+                        return (mode, .failure(error))
+                    }
                 }
             }
             var result = RewriteResult()
-            for await (mode, text) in group {
-                result.results[mode] = text
+            var firstError: String?
+            for await (mode, outcome) in group {
+                switch outcome {
+                case .success(let text):
+                    result.results[mode] = text
+                case .failure(let error):
+                    let description = (error as? RewriterError)?.description
+                        ?? String(describing: error)
+                    DebugLog.info("Rewriter \(mode.rawValue) failed: \(description)")
+                    result.results[mode] = "[error: \(description)]"
+                    if firstError == nil { firstError = description }
+                }
+            }
+            if result.results.values.allSatisfy({ $0.hasPrefix("[error:") }),
+               let firstError {
+                result.error = firstError
             }
             return result
         }
     }
 
     private func rewrite(text: String, mode: RewriteMode) async throws -> String {
-        let prompt = String(format: userPrompts[mode]!, text)
+        guard let promptTemplate = userPrompts[mode] else {
+            throw RewriterError.badJSON("missing prompt template for \(mode)")
+        }
+        let prompt = String(format: promptTemplate, text)
         let body: [String: Any] = [
             "model": model,
             "messages": [
@@ -63,16 +101,47 @@ public struct Rewriter {
             "max_tokens": 1000,
             "temperature": 0.7
         ]
-        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
+
+        guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else {
+            throw RewriterError.networkFailure("invalid URL")
+        }
+        var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, _) = try await session.data(for: request)
-        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
-        let choices = json["choices"] as! [[String: Any]]
-        let message = choices[0]["message"] as! [String: Any]
-        return (message["content"] as! String).trimmingCharacters(in: .whitespacesAndNewlines)
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw RewriterError.networkFailure(error.localizedDescription)
+        }
+
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            let preview = String(data: data, encoding: .utf8)?.prefix(200) ?? "<non-utf8>"
+            throw RewriterError.badJSON("unparseable (status=\(status)): \(preview)")
+        }
+
+        if status < 200 || status >= 300 {
+            let apiMessage = (json["error"] as? [String: Any])?["message"] as? String
+                ?? String(data: data, encoding: .utf8)?.prefix(200).description
+                ?? "unknown"
+            throw RewriterError.apiError(status: status, message: apiMessage)
+        }
+
+        guard
+            let choices = json["choices"] as? [[String: Any]],
+            let first = choices.first,
+            let message = first["message"] as? [String: Any],
+            let content = message["content"] as? String
+        else {
+            let preview = String(data: data, encoding: .utf8)?.prefix(200) ?? "<non-utf8>"
+            throw RewriterError.badJSON("missing choices[].message.content in: \(preview)")
+        }
+
+        return content.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

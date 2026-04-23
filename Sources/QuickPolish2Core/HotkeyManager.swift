@@ -16,7 +16,7 @@ public final class HotkeyManager {
 
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
-        InstallEventHandler(
+        let handlerStatus = InstallEventHandler(
             GetApplicationEventTarget(),
             { _, event, userData -> OSStatus in
                 guard let ptr = userData else { return noErr }
@@ -27,12 +27,17 @@ public final class HotkeyManager {
             1, &eventType, selfPtr, &eventHandler
         )
 
+        if handlerStatus != noErr {
+            DebugLog.info("❌ InstallEventHandler failed: OSStatus=\(handlerStatus)")
+            return
+        }
+
         var hotKeyID = EventHotKeyID()
         hotKeyID.signature = 0x51504753  // 'QPGS'
         hotKeyID.id = 1
 
         // Control+G: kVK_ANSI_G = 5, controlKey modifier
-        RegisterEventHotKey(
+        let registerStatus = RegisterEventHotKey(
             UInt32(kVK_ANSI_G),
             UInt32(controlKey),
             hotKeyID,
@@ -41,7 +46,12 @@ public final class HotkeyManager {
             &hotKeyRef
         )
 
-        print("[QP] Carbon hotkey registered: Ctrl+G")
+        if registerStatus == noErr {
+            DebugLog.info("✅ Carbon hotkey registered: Ctrl+G")
+        } else {
+            // -9878 = eventHotKeyExistsErr — another app owns this combo
+            DebugLog.info("❌ RegisterEventHotKey failed: OSStatus=\(registerStatus)")
+        }
     }
 
     public func stopListening() {

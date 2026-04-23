@@ -1,35 +1,29 @@
 import AppKit
-import ApplicationServices
 
 public struct TextAccessor {
 
-    /// Reads the currently selected text via AXUIElement — no Cmd+C needed.
-    public static func getSelectedText() -> String? {
-        let system = AXUIElementCreateSystemWide()
-
-        var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            system,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedRef
-        ) == .success, let focusedRef else { return nil }
-
-        let focused = focusedRef as! AXUIElement
-        var selectedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            focused,
-            kAXSelectedTextAttribute as CFString,
-            &selectedRef
-        ) == .success,
-        let text = selectedRef as? String,
-        !text.isEmpty else { return nil }
-
-        return text
+    /// Reads non-empty plain text off the general pasteboard, or `nil` if the
+    /// pasteboard has nothing usable. The workflow is intentional:
+    ///
+    ///     1. User selects text in any app
+    ///     2. User presses Cmd+C
+    ///     3. User presses Ctrl+G
+    ///
+    /// This sidesteps every failure mode of Accessibility / AXUIElement —
+    /// works reliably in Chrome, Notion, Electron apps, browser text boxes,
+    /// terminal, the system-wide selection in Notes, everywhere.
+    public static func getClipboardText() -> String? {
+        guard let raw = NSPasteboard.general.string(forType: .string) else {
+            return nil
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : raw
     }
 
-    /// Writes text to clipboard and simulates Cmd+V.
-    /// NSPanel never steals focus, so the target element stays focused
-    /// and receives the paste event directly.
+    /// Writes text to the clipboard and simulates Cmd+V so it lands in
+    /// whatever app had focus when the hotkey fired. The `NSPanel` we show
+    /// never takes keyboard focus, so the target element is still receiving
+    /// keystrokes here.
     public static func pasteText(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)

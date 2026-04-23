@@ -47,8 +47,12 @@ final class RewriterTests: XCTestCase {
         let result = await rewriter.rewriteAll(text: "hello")
 
         for mode in RewriteMode.allCases {
-            XCTAssertEqual(result.text(for: mode), "[error]")
+            XCTAssertTrue(
+                result.text(for: mode).hasPrefix("[error:"),
+                "Expected mode \(mode) to have an error-prefixed placeholder, got: \(result.text(for: mode))"
+            )
         }
+        XCTAssertNotNil(result.error, "All-modes failure should surface a top-level error")
     }
 
     func test_rewriteAll_includesAuthHeader() async {
