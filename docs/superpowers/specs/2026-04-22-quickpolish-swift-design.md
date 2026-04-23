@@ -1,157 +1,339 @@
 # QuickPolish Swift — Design Spec
-Date: 2026-04-22
+
+**Date:** 2026-04-22 (revised 2026-04-23 to match as-built code)
 
 ## Overview
 
-A macOS background app built in SwiftUI that rewrites selected text using the OpenAI API. Press Control+G on any selected text in any app, see a floating preview with three rewrite modes, click Replace to swap the text in place.
+A macOS background app built in Swift/SwiftUI/AppKit that rewrites clipboard
+text using the OpenAI API. User copies text (⌘C), presses **⌃G**, sees a
+floating preview with three rewrite modes, clicks Replace to paste the
+rewritten version into wherever they were typing.
 
-Built in Swift/SwiftUI for macOS 15+ (Sequoia). The window never steals keyboard focus, solving the paste reliability issues of the Python version entirely.
+Targets macOS 13+. No Dock icon — menubar-only background app
+(`.accessory` activation policy).
 
 ---
 
 ## User Flow
 
-1. Select text in any macOS app (Gmail, Notion, Messages, etc.)
-2. Press **Control+G**
-3. App reads selected text via `AXUIElement` (no Cmd+C needed)
-4. Floating panel appears — Chrome/any app keeps keyboard focus throughout
-5. Three parallel OpenAI API requests fire immediately
-6. Preview shows Natural result by default; click mode pills to switch
-7. Click **Replace** → result written to clipboard → Cmd+V → text replaced
-8. Or click **Cancel** → panel closes, original text unchanged
+1. User selects text in any macOS app (Gmail, Notion, Terminal, Chrome, …)
+2. User presses **⌘C** to copy it to the clipboard
+3. User presses **⌃G**
+4. QuickPolish reads the clipboard, shows a floating `NSPanel`, and fires three
+   OpenAI API calls in parallel
+5. Preview renders Natural by default; clicking a mode pill switches the view
+6. User clicks **Replace** → QuickPolish writes the chosen rewrite to the
+   clipboard and synthesizes ⌘V, replacing the originally selected text
+7. Or user clicks **Cancel** → panel closes, clipboard still holds the
+   original text the user had copied
+8. If the clipboard is empty when ⌃G is pressed, a small transient hint panel
+   floats in from the top of the screen (`HintPanel`) telling the user to
+   copy text first
 
 ---
 
-## Why Swift Solves the Paste Problem
+## Why ⌘C → ⌃G (Instead of Just ⌃G on Selection)
 
-The Python version failed because tkinter windows steal keyboard focus from Chrome, causing Gmail's compose box to lose its selection. In Swift:
+**The first iteration** tried reading the selection directly via
+`AXUIElement` (`AXUIElementCopyAttributeValue` with
+`kAXSelectedTextAttribute`). This was abandoned because:
 
-- `NSPanel` with `NSWindowStyleMask.nonactivatingPanel` **never** takes keyboard focus
-- Chrome/Gmail compose box stays focused the entire time
-- Cmd+V fires while the target element is still focused → paste always works
+- `AXUIElement` requires Accessibility permission, which is TCC-tracked by
+  cdhash. Swift Package Manager's ad-hoc signing gives every rebuild a
+  fresh cdhash, so the permission dies every time you recompile.
+- Even with permission granted, the API silently fails in Electron apps,
+  Chrome text fields, and many browser-hosted editors (Gmail, Notion, most
+  rich text inputs) because those apps don't expose focused-element
+  attributes through the standard AX path.
+- The fallback of synthesizing ⌘C ourselves and reading the clipboard
+  worked in some apps but was flaky and introduced race conditions with
+  pasteboard restoration.
+
+**Lifting the ⌘C responsibility to the user** makes the "read" side 100%
+reliable in exchange for one extra keystroke. Reading from
+`NSPasteboard.general` works identically in every app, requires no special
+permission, and has zero timing issues.
+
+---
+
+## Permissions Required
+
+- **Input Monitoring** — to synthesize ⌘V via `CGEvent.post(tap:)`. Prompted
+  by macOS on first Replace. Grant persists across rebuilds when the binary
+  is signed with a stable identity (see Stable Signing below).
+- **Accessibility** — **not required**. Removed entirely compared to the
+  first iteration.
 
 ---
 
 ## Rewrite Modes
 
-| Mode | Prompt |
-|------|--------|
-| **Natural** | Understand the intended meaning and express it the way you'd say it to a friend — casual, chill, natural American English. Not a grammar fix, not a translation. Think: how would a native speaker say this in a text message? |
-| **Professional** | Understand the intended meaning and express it for a professional email context. Sound confident, direct, and warm — like a real person, not a robot. No corporate filler: no "I hope this email finds you well", no "please don't hesitate to reach out", no "as per my previous email". |
-| **Shorter** | Understand the intended meaning, express it in natural American English, then cut it down. Remove redundancy without losing the point. Keep the appropriate register. |
+| Mode | Prompt intent |
+|------|---------------|
+| **Natural** | Casual American English, like texting a friend. Chill and real. |
+| **Professional** | Confident, direct, warm email tone. Explicitly rejects corporate filler ("I hope this email finds you well", "please don't hesitate to reach out", etc.). |
+| **Shorter** | Natural American English, then trimmed. Remove redundancy, keep meaning and tone. |
 
-### Shared constraints
-- Always output English only
-- Input may be Chinese, English, or Chinglish — always output natural American English
-- Do not translate literally — understand intent, express it naturally
-- Do not sound like AI. No filler phrases
-- Return ONLY the rewritten text, nothing else
+### Shared constraints (system prompt)
+- Output English only, regardless of input language
+- Input may be Chinese, English, or Chinglish
+- Don't translate literally — understand intent, express it naturally
+- Don't sound like AI. No filler phrases
+- Return ONLY the rewritten text — no quotes, no explanation
+
+Default model: `gpt-4o-mini` (swap via `Rewriter.init(model:)`).
 
 ---
 
 ## Architecture
 
-Background-only app (no Dock icon). Menubar icon for settings and quit.
+Two SPM targets:
+
+- **`QuickPolish2`** (executable) — thin `main.swift` that sets the
+  activation policy and hands off to `AppDelegate`.
+- **`QuickPolish2Core`** (library) — all business logic, testable.
+
+### File map
 
 ```
-QuickPolishApp.swift    — App entry point, LSUIElement background app
-AppDelegate.swift       — NSStatusItem menubar icon, Accessibility permission check
-HotkeyManager.swift     — NSEvent global monitor for Ctrl+G
-TextAccessor.swift      — AXUIElement: read selected text + clipboard paste to replace
-Rewriter.swift          — OpenAI API, 3 parallel async/await requests, prompts
-PreviewPanel.swift      — NSPanel subclass, nonactivatingPanel + floating
-PreviewView.swift       — SwiftUI UI: text display, mode pills, Replace/Cancel buttons
-Config.swift            — API key stored in macOS Keychain
-Models.swift            — Mode enum, RewriteState struct
+Sources/QuickPolish2/main.swift             — NSApplication entry point
+Sources/QuickPolish2Core/
+  AppDelegate.swift                         — menubar, hotkey, panel lifecycle
+  HotkeyManager.swift                       — Carbon RegisterEventHotKey ⌃G
+  TextAccessor.swift                        — clipboard read + ⌘V synthesis
+  Rewriter.swift                            — OpenAI API, 3-way parallel async
+  Config.swift                              — reads OPENAI_API_KEY from
+                                              ~/.quickpolish/.env.local
+  Models.swift                              — RewriteMode, RewriteResult,
+                                              PreviewState enums
+  PreviewViewModel.swift                    — @Published ObservableObject
+  PreviewView.swift                         — SwiftUI panel contents
+  PreviewPanel.swift                        — NSPanel subclass (non-key)
+  HintPanel.swift                           — transient "copy first" toast
+  DebugLog.swift                            — NSLog + file logger
+                                              (~/.quickpolish/quickpolish.log)
+
+Tests/QuickPolish2Tests/
+  ModelsTests.swift                         — RewriteResult + ViewModel
+  ConfigTests.swift                         — .env.local parsing
+  RewriterTests.swift                       — URLSession mock + error paths
+
+scripts/
+  setup-signing.sh                          — one-time: create self-signed
+                                              cert in login keychain
+  run.sh                                    — swift build + codesign +
+                                              kill old pid + relaunch
 ```
+
+### Hotkey registration
+
+`HotkeyManager` uses Carbon's `RegisterEventHotKey` + `InstallEventHandler`
+against the application event target. This intentionally does **not** use
+`NSEvent.addGlobalMonitorForEvents`, which requires Input Monitoring just to
+observe the hotkey. Carbon's mechanism needs no special permission for
+system-wide registration.
 
 ---
 
 ## UI Design
 
-Dark frosted glass floating panel, always on top, centered on screen.
+Centered floating panel, dark frosted glass, ~460×280 pt.
 
 ```
 ┌─────────────────────────────────────────┐
-│  ✦ QuickPolish                          │  ← title bar, dark
+│  ✦ QuickPolish                          │  ← title bar
 ├─────────────────────────────────────────┤
 │                                         │
-│  Hey Matt, thanks for setting up the    │  ← rewritten text
-│  interview. Didn't see the link —       │
-│  is it over the phone or Zoom?          │
+│  Rewritten text appears here, scrollable│
+│  if it's long, selectable so the user   │
+│  can read it cleanly.                   │
 │                                         │
 ├─────────────────────────────────────────┤
-│  ╭──────────╮ ╭──────────────╮ ╭──────╮ │  ← glass morphism pills
-│  │ Natural  │ │ Professional │ │Short │ │
-│  ╰──────────╯ ╰──────────────╯ ╰──────╯ │
+│  ╭─────────╮  Professional   Shorter    │  ← mode pills
+│  │ Natural │                            │
+│  ╰─────────╯                            │
 ├─────────────────────────────────────────┤
-│      [ Replace ]           [ Cancel ]   │
+│  Cancel                       [Replace] │
 └─────────────────────────────────────────┘
 ```
 
-**Mode pills (glass morphism on macOS 15):**
-- Background: `.ultraThinMaterial`
-- Border: gradient stroke (white 30% opacity top-left → clear bottom-right)
-- Shadow: soft drop shadow
-- Selected: accent color tint + brighter border
-- On macOS 26+: swap to `.glassEffect()` directly
+- Background: `.ultraThinMaterial` + 45% black overlay for readability on
+  light desktops
+- Colors: dark background `#1C1C1E`, text white, accent blue `#5B9CF6`,
+  muted gray `#636366`
+- Shadow: soft drop shadow from the SwiftUI view itself (NSPanel
+  `hasShadow = false` to avoid double shadow)
+- Loading: spinner + "Rewriting…" while API calls are in flight
+- Error: red text showing the API error message (e.g. `[error: API 401:
+  Incorrect API key provided]`)
 
-**Loading state:** spinner + "Rewriting…" text while API calls in flight.
+### Panel focus behavior
 
-**Colors:** dark background `#1C1C1E`, text white, accent blue `#5B9CF6`, muted gray `#636366`.
+`PreviewPanel.canBecomeKey` and `canBecomeMain` both return `false`. This
+is a deliberate trade-off:
+
+- **Pro**: Replace works reliably. The original app still has keyboard
+  focus when we synthesize ⌘V, so the paste lands in the right text field.
+- **Con**: The panel can't receive keyboard events, so Tab / Enter / Esc
+  don't work as shortcuts. Users must click buttons / pills.
+
+This is the known UX weakness vs. the Python version of QuickPolish, which
+sidesteps it by (a) letting its Tk window take focus and (b) using
+`osascript … tell application "<target>" to activate` to switch focus back
+before pasting. A future iteration could adopt the same approach (track the
+frontmost app at hotkey time, activate it before the Replace key synth,
+enable Tab/Enter/Esc) — see Known Limitations below.
+
+### Hint panel
+
+`HintPanel` is a separate small floating panel (380×72 pt) that appears
+near the top of the screen when the user presses ⌃G with an empty
+clipboard. It fades in over 180 ms, stays 2.4 s, fades out over 220 ms.
+Its content is an SF Symbol + title ("Clipboard is empty") + subtitle
+("Copy text with ⌘C first, then press ⌃G").
 
 ---
 
 ## Text Access
 
-**Reading selected text:**
+### Reading (clipboard)
+
 ```swift
-// Via AXUIElement — no Cmd+C needed
-let systemElement = AXUIElementCreateSystemWide()
-var focusedElement: CFTypeRef?
-AXUIElementCopyAttributeValue(systemElement, kAXFocusedUIElementAttribute as CFString, &focusedElement)
-var selectedText: CFTypeRef?
-AXUIElementCopyAttributeValue(focusedElement as! AXUIElement, kAXSelectedTextAttribute as CFString, &selectedText)
+public static func getClipboardText() -> String? {
+    guard let raw = NSPasteboard.general.string(forType: .string) else {
+        return nil
+    }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : raw
+}
 ```
 
-**Replacing text:**
+### Replacing (synthesized ⌘V)
+
 ```swift
-// Write to clipboard, then simulate Cmd+V
-// NSPanel never stole focus, so target app's element is still focused
-NSPasteboard.general.clearContents()
-NSPasteboard.general.setString(result, forType: .string)
-// Simulate Cmd+V via CGEvent
-let src = CGEventSource(stateID: .hidSystemState)
-let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)
-let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
-keyDown?.flags = .maskCommand
-keyUp?.flags = .maskCommand
-keyDown?.post(tap: .cghidEventTap)
-keyUp?.post(tap: .cghidEventTap)
+public static func pasteText(_ text: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+
+    guard let source = CGEventSource(stateID: .hidSystemState) else { return }
+    let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true)
+    let keyUp   = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false)
+    keyDown?.flags = .maskCommand
+    keyUp?.flags   = .maskCommand
+    keyDown?.post(tap: .cghidEventTap)
+    keyUp?.post(tap: .cghidEventTap)
+}
 ```
+
+Because `PreviewPanel` never became key, the original text field is still
+focused when the synthesized ⌘V arrives.
 
 ---
 
 ## Configuration
 
-API key stored in macOS Keychain (`com.quickpolish.openai-key`). First launch shows a setup sheet to enter the key. Accessible from menubar icon.
+API key lives in **`~/.quickpolish/.env.local`** as `OPENAI_API_KEY=sk-…`.
+`Config.apiKey` rereads the file on every access so editing the file takes
+effect on the next ⌃G without restarting the app.
+
+The original design stored the key in Keychain; that was dropped because:
+
+- Reading from Keychain requires entitlements for a signed bundle, adding
+  friction for a local-dev Mach-O
+- `.env.local` is trivial to edit with any editor
+- The `.quickpolish` directory is already used for the log file, so no
+  new filesystem footprint
+
+Menubar → **Set API Key…** opens the file in the default text editor,
+creating it with a template line if missing.
 
 ---
 
-## macOS Permissions Required
+## Stable Code Signing (scripts/setup-signing.sh + scripts/run.sh)
 
-- **Accessibility** — to read selected text via AXUIElement and simulate Cmd+V
-- Prompted on first launch with instructions to System Settings
+macOS TCC (Transparency, Consent, and Control) tracks permissions by the
+binary's designated requirement (DR). For an **ad-hoc-signed** binary the DR
+includes the `cdhash`, which changes on every compile — so every rebuild
+invalidates every permission grant. This made development unusable until we
+introduced stable signing.
+
+### setup-signing.sh (one-time)
+
+1. If `QuickPolishLocal` identity already exists in login keychain, no-op
+2. Use LibreSSL (`/usr/bin/openssl`, preferred over Homebrew/Anaconda
+   OpenSSL 3 which produces PKCS12 bundles `security` can't read) to
+   generate a self-signed cert with `extendedKeyUsage=codeSigning` and a
+   matching RSA private key
+3. Bundle into PKCS12 with `PBE-SHA1-3DES` / `SHA1 MAC` legacy algorithms
+   (required by macOS Security.framework) and a throwaway password
+   (`security import` refuses empty-password p12 even with legacy algos)
+4. Import into login keychain with `-T /usr/bin/codesign` so codesign can
+   use the key without a GUI prompt
+5. `security set-key-partition-list` to skip the ACL prompt on first use
+
+### run.sh (every build)
+
+1. Check that `QuickPolishLocal` identity exists (unfiltered
+   `security find-identity` — self-signed certs show up as
+   `(CSSMERR_TP_NOT_TRUSTED)` under `-v`, but that's fine for local signing)
+2. `swift build`
+3. `codesign --force --sign QuickPolishLocal -i com.quickpolish.QuickPolish2 .build/debug/QuickPolish2`
+   — the `-i` identifier is the other half of the DR, paired with the
+   cert's Common Name
+4. `codesign -dvvv` the binary, printing Identifier + Authority so the user
+   can verify
+5. `pkill -x QuickPolish2` then relaunch
+
+Result: every rebuild has the **same DR** (`identifier
+"com.quickpolish.QuickPolish2" and anchor <QuickPolishLocal>`), so macOS
+keeps the Input Monitoring grant alive forever.
 
 ---
 
-## Info.plist Keys
+## Error Handling
 
-```xml
-<key>LSUIElement</key><true/>          <!-- background app, no Dock icon -->
-<key>NSAccessibilityUsageDescription</key>
-<string>QuickPolish needs Accessibility access to read your selected text and paste the rewritten version.</string>
-```
+`Rewriter` returns structured `RewriterError` values:
+
+- `.networkFailure(String)` — URLSession threw (connection lost,
+  DNS failure, …)
+- `.apiError(status: Int, message: String)` — HTTP non-2xx (401 bad key,
+  429 rate limit, 400 invalid model, …)
+- `.badJSON(String)` — parseable response didn't match the expected shape
+  (e.g. OpenAI returned `{"error": …}` where choices were expected)
+
+`rewriteAll` runs all three modes concurrently via `withTaskGroup` and
+swallows per-mode failures into `"[error: <description>]"` placeholders in
+`result.results[mode]`. If all three modes fail with the same error,
+`result.error` is also set so the UI can show a single top-level message.
+
+All failures are logged to `~/.quickpolish/quickpolish.log` via
+`DebugLog.info`.
+
+---
+
+## Known Limitations (vs. Python QuickPolish)
+
+The Python version (<https://github.com/JaimeYeung/QuickPolish>) has a few
+UX advantages this Swift version doesn't currently replicate:
+
+1. **Preview is read-only.** Python version's Tk `Text` widget lets users
+   edit the rewrite before pasting. Would require a SwiftUI `TextEditor`
+   here, plus making the panel key-capable (see #2).
+2. **No Tab/Enter/Esc keyboard navigation.** Panel can't be key without
+   losing the focus-preservation trick. Python works around this by
+   storing the frontmost app's name at hotkey time and calling
+   `osascript activate` before the ⌘V. A Swift equivalent would use
+   `NSWorkspace.shared.frontmostApplication` at hotkey time and
+   `NSRunningApplication.activate` before paste.
+3. **Still requires manual ⌘C.** Python synthesizes it internally using
+   osascript + a sentinel clipboard value. Swift could do the same via
+   `CGEvent` but would introduce the same timing/race complexity we
+   already rejected once.
+4. **No em/en dash sanitization.** Python `strip_ai_dashes` replaces
+   em/en dashes with commas because GPT loves them and they look
+   AI-generated. Trivial to port.
+
+None of these were fixed in this iteration; documenting for future work.
 
 ---
 
@@ -161,4 +343,5 @@ API key stored in macOS Keychain (`com.quickpolish.openai-key`). First launch sh
 - History of past rewrites
 - iOS / iPadOS version
 - iCloud sync
-- Distributing a pre-signed .app (users build from source)
+- Pre-built signed `.app` bundle distribution (users build from source)
+- Notarization / Gatekeeper-friendly distribution
