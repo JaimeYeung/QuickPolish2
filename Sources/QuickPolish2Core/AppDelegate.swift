@@ -11,9 +11,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     public override init() {}
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
+        print("[QP] app launched")
         setupMenubar()
         setupHotkey()
         checkAccessibilityPermission()
+        print("[QP] hasApiKey=\(Config.shared.hasApiKey) apiKey=\(Config.shared.apiKey?.prefix(10) ?? "nil")")
     }
 
     // MARK: - Menubar
@@ -58,14 +60,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.handleHotkey()
         }
         hotkeyManager.startListening()
+        print("[QP] hotkey listener started")
     }
 
     private func handleHotkey() {
+        print("[QP] hotkey fired!")
         guard Config.shared.hasApiKey else {
+            print("[QP] no API key")
             showApiKeyInput()
             return
         }
-        guard let text = TextAccessor.getSelectedText() else { return }
+        let text = TextAccessor.getSelectedText()
+        print("[QP] selected text: \(text?.prefix(50) ?? "nil")")
+        guard let text else { return }
         showPreview(for: text)
     }
 
@@ -102,7 +109,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Accessibility
 
     private func checkAccessibilityPermission() {
-        if !AXIsProcessTrusted() {
+        if AXIsProcessTrusted() {
+            print("[QP] Accessibility: granted")
+        } else {
+            print("[QP] Accessibility: NOT granted — opening System Settings")
             let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             AXIsProcessTrustedWithOptions(opts)
         }
