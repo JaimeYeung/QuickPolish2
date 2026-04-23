@@ -33,22 +33,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showApiKeyInput() {
+        NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "OpenAI API Key"
-        alert.informativeText = "Enter your OpenAI API key. Stored securely in your Keychain."
-        alert.addButton(withTitle: "Save")
+        alert.messageText = "API Key Not Found"
+        alert.informativeText = "Add your OpenAI API key to:\n\(Config.shared.envFilePath)\n\nFormat:\nOPENAI_API_KEY=sk-..."
+        alert.addButton(withTitle: "Open File")
         alert.addButton(withTitle: "Cancel")
 
-        let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        input.placeholderString = "sk-..."
-        input.stringValue = Config.shared.apiKey ?? ""
-        alert.accessoryView = input
-
         if alert.runModal() == .alertFirstButtonReturn {
-            let trimmed = input.stringValue.trimmingCharacters(in: .whitespaces)
-            Config.shared.apiKey = trimmed.isEmpty ? nil : trimmed
+            let path = Config.shared.envFilePath
+            if !FileManager.default.fileExists(atPath: path) {
+                try? "OPENAI_API_KEY=sk-your-key-here".write(toFile: path, atomically: true, encoding: .utf8)
+            }
+            NSWorkspace.shared.open(URL(fileURLWithPath: path))
         }
+        NSApp.setActivationPolicy(.accessory)
     }
 
     // MARK: - Hotkey

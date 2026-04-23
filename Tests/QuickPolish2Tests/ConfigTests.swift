@@ -1,42 +1,43 @@
 import XCTest
 @testable import QuickPolish2Core
 
-final class MockKeychain: KeychainService {
-    var storage: [String: String] = [:]
-    func read(key: String) -> String? { storage[key] }
-    func write(key: String, value: String) { storage[key] = value }
-    func delete(key: String) { storage.removeValue(forKey: key) }
-}
-
 final class ConfigTests: XCTestCase {
 
-    func test_hasApiKey_falseWhenNoKeyStored() {
-        let config = Config(keychain: MockKeychain())
+    func test_hasApiKey_falseWhenFileDoesNotExist() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let config = Config(envDirectory: dir)
         XCTAssertFalse(config.hasApiKey)
     }
 
-    func test_hasApiKey_trueAfterKeySet() {
-        let config = Config(keychain: MockKeychain())
-        config.apiKey = "sk-test"
+    func test_apiKey_parsedFromEnvFile() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent(".env.local")
+        try "OPENAI_API_KEY=sk-test123".write(to: file, atomically: true, encoding: .utf8)
+
+        let config = Config(envDirectory: dir)
+        XCTAssertEqual(config.apiKey, "sk-test123")
         XCTAssertTrue(config.hasApiKey)
     }
 
-    func test_apiKey_nilAfterDelete() {
-        let config = Config(keychain: MockKeychain())
-        config.apiKey = "sk-test"
-        config.apiKey = nil
+    func test_apiKey_nilWhenKeyMissingFromFile() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent(".env.local")
+        try "OTHER_VAR=hello".write(to: file, atomically: true, encoding: .utf8)
+
+        let config = Config(envDirectory: dir)
         XCTAssertNil(config.apiKey)
     }
 
-    func test_apiKey_persistsValue() {
-        let config = Config(keychain: MockKeychain())
-        config.apiKey = "sk-abc123"
-        XCTAssertEqual(config.apiKey, "sk-abc123")
-    }
+    func test_apiKey_handlesWhitespace() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent(".env.local")
+        try "OPENAI_API_KEY=  sk-abc  ".write(to: file, atomically: true, encoding: .utf8)
 
-    func test_hasApiKey_falseForWhitespaceOnly() {
-        let config = Config(keychain: MockKeychain())
-        config.apiKey = "   "
-        XCTAssertFalse(config.hasApiKey)
+        let config = Config(envDirectory: dir)
+        XCTAssertEqual(config.apiKey, "sk-abc")
     }
 }

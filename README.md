@@ -26,7 +26,14 @@ cd QuickPolish2
 open Package.swift
 ```
 
-In Xcode, press **▶ Run**. On first launch, click the menubar icon and enter your OpenAI API key.
+Create your API key file:
+
+```bash
+mkdir -p ~/.quickpolish
+echo "OPENAI_API_KEY=sk-your-key-here" > ~/.quickpolish/.env.local
+```
+
+Then in Xcode, press **▶ Run**.
 
 Get an API key at [platform.openai.com](https://platform.openai.com).
 
